@@ -64,6 +64,10 @@ You can prompt the model in English or Asante Twi:
 User 💬: How does a solar panel generate electricity?
 Ghana-LLM 🇬🇭: Solar panel yɛ anyinam ahoɔden mfiri a ɛde owia hann dan anyinam ahoɔden. Sɛ owia bɔ so a...
 
+User 💬: Translate the following English text into Asante Twi:
+"Proper spacing ensures each cocoa tree gets enough sunlight, soil nutrients, and airflow."
+Ghana-LLM 🇬🇭: Sɛ wugyaw kwan a ɛfata wɔ kookoo nnua ntam a, ɛma dua biara nya owia hann, asase mu aduane, ne mframa a ɛkɔ mu yiye.
+
 User 💬: Ɛhe na me nsa bɛka Ghana Immigration Service ti dwumadibea?
 Ghana-LLM 🇬🇭: Ghana Immigration Service ti dwumadibea no wɔ Off Starlets 91 Road, Ministries, Accra...
 ```
