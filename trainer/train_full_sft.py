@@ -13,15 +13,36 @@ import torch.distributed as dist
 from contextlib import nullcontext
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
 warnings.filterwarnings('ignore')
 
+best_val_loss = float('inf')
+patience_counter = 0
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+def evaluate(val_loader):
+    model.eval()
+    val_loss = 0.0
+    val_steps = 0
+    with torch.no_grad():
+        for input_ids, labels in val_loader:
+            input_ids = input_ids.to(args.device)
+            labels = labels.to(args.device)
+            with autocast_ctx:
+                res = model(input_ids, labels=labels)
+                loss = res.loss + (res.aux_loss if res.aux_loss is not None else 0.0)
+            val_loss += loss.item()
+            val_steps += 1
+            if val_steps >= 50:
+                break
+    model.train()
+    return val_loss / max(val_steps, 1)
+
+def train_epoch(epoch, loader, iters, val_loader=None, start_step=0, wandb=None):
+    global best_val_loss, patience_counter
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
@@ -56,6 +77,27 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
+        # Periodic validation & early stopping check
+        if val_loader is not None and (step % args.eval_interval == 0 or step == iters) and is_main_process():
+            v_loss = evaluate(val_loader)
+            Logger(f'>>> Eval at step {step}: val_loss = {v_loss:.4f} (best: {best_val_loss:.4f})')
+            if wandb: wandb.log({"val_loss": v_loss})
+            if v_loss < best_val_loss - args.min_delta:
+                best_val_loss = v_loss
+                patience_counter = 0
+                moe_suffix = '_moe' if lm_config.use_moe else ''
+                ckp_best = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+                raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+                raw_model = getattr(raw_model, '_orig_mod', raw_model)
+                torch.save({k: v.half().cpu() for k, v in raw_model.state_dict().items()}, ckp_best)
+                Logger(f'>>> New best model checkpoint saved with val_loss: {best_val_loss:.4f}')
+            else:
+                patience_counter += 1
+                Logger(f'>>> Val loss did not improve ({patience_counter}/{args.early_stopping_patience} checks)')
+                if patience_counter >= args.early_stopping_patience:
+                    Logger(f'>>> Early stopping triggered! Model converged (best val_loss: {best_val_loss:.4f}).')
+                    return True
+
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -70,13 +112,17 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             del state_dict
 
         del input_ids, labels, res, loss
+    return False
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MiniMind Full SFT")
+    parser = argparse.ArgumentParser(description="Ghana-LLM Full SFT")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='full_sft', type=str, help="保存权重的前缀名")
-    parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
+    parser.add_argument("--epochs", type=int, default=100, help="训练轮数 (默认100，受Early Stopping控制)")
+    parser.add_argument("--early_stopping_patience", type=int, default=5, help="Early stopping耐心值 (连续多少次eval不提升则停止)")
+    parser.add_argument("--eval_interval", type=int, default=1000, help="验证集评估步数间隔")
+    parser.add_argument("--min_delta", type=float, default=0.001, help="早停最小改善阈值")
     parser.add_argument("--batch_size", type=int, default=16, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
@@ -125,7 +171,19 @@ if __name__ == "__main__":
     
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    full_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    
+    # Validation split (fixed 2,000 samples for validation)
+    val_size = min(2000, max(500, int(len(full_ds) * 0.02)))
+    train_size = len(full_ds) - val_size
+    train_ds, val_ds = torch.utils.data.random_split(
+        full_ds,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(args.seed)
+    )
+    Logger(f'Dataset split: {len(train_ds):,} training samples, {len(val_ds):,} validation samples.')
+    
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -153,11 +211,18 @@ if __name__ == "__main__":
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        
+        Logger(f'=== Starting Epoch [{epoch + 1}/{args.epochs}] ===')
+        stop_early = False
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+            stop_early = train_epoch(epoch, loader, len(loader) + skip, val_loader, start_step, wandb)
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            stop_early = train_epoch(epoch, loader, len(loader), val_loader, 0, wandb)
+            
+        if stop_early:
+            Logger(f'Early Stopping triggered. Halting SFT training after epoch {epoch + 1}/{args.epochs}.')
+            break
     
     # ========== 9. 清理分布进程 ==========
     if dist.is_initialized():
